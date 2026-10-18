@@ -554,6 +554,10 @@ impl Window {
         let data = XdgActivationTokenData::Obtain((self.window_id, serial));
         let xdg_activation_token = xdg_activation.get_activation_token(&self.queue_handle, data);
         xdg_activation_token.set_surface(self.surface());
+        // The latest click, so the compositor knows the request comes from the user's action.
+        self.window_state.lock().unwrap().apply_on_pointer(|_, data| {
+            xdg_activation_token.set_serial(data.latest_button_serial(), data.seat());
+        });
         xdg_activation_token.commit();
 
         Ok(serial)
