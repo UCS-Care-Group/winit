@@ -30,6 +30,9 @@ use crate::platform_impl::wayland::{make_wid, WindowId};
 
 const URI_LIST: &str = "text/uri-list";
 
+/// The most bytes read for a dragged list; a longer list is dropped whole.
+const MAX_URI_LIST_BYTES: usize = 1024 * 1024;
+
 /// A file drag over one of our windows.
 #[derive(Debug)]
 pub struct FileDrag {
@@ -118,6 +121,14 @@ impl WinitState {
                 PostAction::Remove
             },
             Ok(read) => {
+                if drag.buffer.len().saturating_add(read) > MAX_URI_LIST_BYTES {
+                    warn!("A dragged file list is too long, ignoring the drop");
+                    drag.reader = None;
+                    drag.paths = Some(Vec::new());
+                    drag.buffer = Vec::new();
+                    self.advance_file_drag(seat);
+                    return PostAction::Remove;
+                }
                 drag.buffer.extend_from_slice(&chunk[..read]);
                 PostAction::Continue
             },
@@ -381,10 +392,10 @@ mod tests {
 
     #[test]
     fn reads_file_uris() {
-        assert_eq!(paths("file:///home/me/a.txt\r\nfile:///tmp/b%20c.png\r\n"), [
-            PathBuf::from("/home/me/a.txt"),
-            PathBuf::from("/tmp/b c.png")
-        ]);
+        assert_eq!(
+            paths("file:///home/me/a.txt\r\nfile:///tmp/b%20c.png\r\n"),
+            [PathBuf::from("/home/me/a.txt"), PathBuf::from("/tmp/b c.png")]
+        );
     }
 
     #[test]
@@ -402,10 +413,10 @@ mod tests {
 
     #[test]
     fn accepts_localhost_and_skips_other_hosts() {
-        assert_eq!(paths("file://localhost/a\r\nfile://LOCALHOST/b\r\nfile://elsewhere/c\r\n"), [
-            PathBuf::from("/a"),
-            PathBuf::from("/b")
-        ]);
+        assert_eq!(
+            paths("file://localhost/a\r\nfile://LOCALHOST/b\r\nfile://elsewhere/c\r\n"),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]

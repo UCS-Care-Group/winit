@@ -31,6 +31,9 @@ const TEXT_MIME_TYPES: [&str; 5] =
 /// How long a paste waits for the source to send more data before giving up.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The most bytes read from another client's selection.
+const MAX_CLIPBOARD_BYTES: usize = 64 * 1024 * 1024;
+
 /// Every live clipboard, so one can be found from the display handle a toolkit is given.
 static CLIPBOARDS: Mutex<Vec<Weak<ClipboardState>>> = Mutex::new(Vec::new());
 
@@ -205,7 +208,7 @@ impl ClipboardState {
         // The source only writes once the compositor has our request.
         self.connection.flush().map_err(|error| io::Error::new(ErrorKind::Other, error))?;
 
-        let bytes = read_with_timeout(File::from(OwnedFd::from(pipe)))?;
+        let bytes = read_with_timeout(File::from(OwnedFd::from(pipe)), MAX_CLIPBOARD_BYTES)?;
         let text = String::from_utf8_lossy(&bytes);
         // `text/*` types use CRLF line endings, but applications expect LF.
         Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
@@ -247,7 +250,7 @@ impl Drop for ClipboardState {
 }
 
 /// Reads a pipe to its end, giving up if the writer stays silent for [`READ_TIMEOUT`].
-fn read_with_timeout(mut file: File) -> io::Result<Vec<u8>> {
+fn read_with_timeout(mut file: File, max_bytes: usize) -> io::Result<Vec<u8>> {
     let fd = file.as_raw_fd();
     // SAFETY: `fd` is a valid descriptor owned by `file`.
     unsafe {
@@ -262,7 +265,15 @@ fn read_with_timeout(mut file: File) -> io::Result<Vec<u8>> {
     loop {
         match file.read(&mut chunk) {
             Ok(0) => return Ok(bytes),
-            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Ok(read) => {
+                if bytes.len().saturating_add(read) > max_bytes {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "the clipboard is too large",
+                    ));
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            },
             Err(error) if error.kind() == ErrorKind::Interrupted => {},
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -283,5 +294,33 @@ fn read_with_timeout(mut file: File) -> io::Result<Vec<u8>> {
             },
             Err(error) => return Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn pipe_with(bytes: &[u8]) -> File {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors `pipe` writes.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors are fresh and owned here.
+        let (mut write, read) = unsafe {
+            (
+                <File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]),
+                <File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]),
+            )
+        };
+        write.write_all(bytes).unwrap();
+        read
+    }
+
+    #[test]
+    fn reads_up_to_the_cap_and_refuses_more() {
+        assert_eq!(read_with_timeout(pipe_with(&[7; 100]), 100).unwrap().len(), 100);
+        let error = read_with_timeout(pipe_with(&[7; 101]), 100).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 }
