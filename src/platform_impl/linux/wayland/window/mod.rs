@@ -24,7 +24,7 @@ use crate::platform_impl::{
     Fullscreen, MonitorHandle as PlatformMonitorHandle, OsError, PlatformIcon,
 };
 use crate::window::{
-    Cursor, CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType,
+    ActivationToken, Cursor, CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType,
     WindowAttributes, WindowButtons, WindowLevel,
 };
 
@@ -561,6 +561,18 @@ impl Window {
         xdg_activation_token.commit();
 
         Ok(serial)
+    }
+
+    pub fn activate_with_token(&self, token: ActivationToken) {
+        let Some(xdg_activation) = self.xdg_activation.as_ref() else {
+            warn!("`activate_with_token` isn't supported");
+            return;
+        };
+        // A Wayland string can't hold a NUL (the request would panic on it); no token has one.
+        if token.token.contains('\0') {
+            return;
+        }
+        xdg_activation.activate(token.token, self.surface());
     }
 
     #[inline]
