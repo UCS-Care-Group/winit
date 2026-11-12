@@ -49,3 +49,5 @@ changelog entry.
   a second one.
 - On Wayland, add `Clipboard::load_mime`, which reads the first of several MIME types (HTML, a
   picture) the clipboard offers, with a size cap.
+- On Wayland, add `Clipboard::offers`, which says whether the clipboard offers a MIME type
+  without reading it, and read the clipboard against one overall deadline.
