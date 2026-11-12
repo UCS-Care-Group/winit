@@ -47,3 +47,5 @@ changelog entry.
 - On Wayland, add `ActiveEventLoopExtWayland::clipboard` and `platform::wayland::Clipboard`, which
   read and write text on the clipboard through winit's data device, so toolkits don't need to bind
   a second one.
+- On Wayland, add `Clipboard::load_mime`, which reads the first of several MIME types (HTML, a
+  picture) the clipboard offers, with a size cap.

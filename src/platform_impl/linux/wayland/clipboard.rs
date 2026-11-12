@@ -214,6 +214,37 @@ impl ClipboardState {
         Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
     }
 
+    /// The first of `mimes` (in the caller's order of preference) that the other client's
+    /// selection offers, with its bytes, at most `max_bytes` of them. Our own selection is text
+    /// alone, so it never answers here: the caller asks for text with `load_text`.
+    pub fn load_mime(&self, mimes: &[&str], max_bytes: usize) -> io::Result<(String, Vec<u8>)> {
+        let inner = self.inner.lock().unwrap();
+        let offer = Self::active_device(&inner)
+            .and_then(|entry| entry.device.data::<DataDeviceData>())
+            .and_then(|data| data.selection_offer());
+        let Some(offer) = offer else {
+            return Err(io::Error::new(ErrorKind::NotFound, "the clipboard is empty"));
+        };
+
+        let types = offer.with_mime_types(|types| types.to_vec());
+        if types.iter().any(|mime| mime == &self.marker) {
+            return Err(io::Error::new(ErrorKind::NotFound, "the clipboard holds our own text"));
+        }
+        let Some(mime) = mimes.iter().find(|mime| types.iter().any(|t| t == **mime)) else {
+            return Err(io::Error::new(ErrorKind::NotFound, "the clipboard holds none of those types"));
+        };
+
+        let pipe = offer.receive((*mime).to_string()).map_err(|error| match error {
+            sctk::data_device_manager::data_offer::DataOfferError::Io(error) => error,
+            other => io::Error::new(ErrorKind::Other, other.to_string()),
+        })?;
+        drop(inner);
+        self.connection.flush().map_err(|error| io::Error::new(ErrorKind::Other, error))?;
+
+        let bytes = read_with_timeout(File::from(OwnedFd::from(pipe)), max_bytes.min(MAX_CLIPBOARD_BYTES))?;
+        Ok(((*mime).to_string(), bytes))
+    }
+
     pub fn store_text(&self, text: String) -> io::Result<()> {
         let Some(manager) = &self.manager else {
             return Err(io::Error::new(ErrorKind::Unsupported, "no data device manager"));

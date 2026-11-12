@@ -80,6 +80,15 @@ impl Clipboard {
         self.state()?.load_text()
     }
 
+    /// The first of `mimes`, in order of preference, that the clipboard of the seat the
+    /// application last received input from offers, as `(type, bytes)`: for HTML and pictures,
+    /// which [`Clipboard::load_text`] doesn't carry. Reads at most `max_bytes` (and never more
+    /// than 64 MiB), and gives up after two seconds of silence like `load_text`. An error of
+    /// kind [`io::ErrorKind::NotFound`] means the clipboard offers none of them.
+    pub fn load_mime(&self, mimes: &[&str], max_bytes: usize) -> io::Result<(String, Vec<u8>)> {
+        self.state()?.load_mime(mimes, max_bytes)
+    }
+
     /// Puts `text` on the clipboard of the seat the application last received input from.
     ///
     /// The compositor accepts it only in response to input, so call this while handling the
