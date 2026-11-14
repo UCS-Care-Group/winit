@@ -27,8 +27,8 @@ use crate::platform_impl::{
     PlatformIcon, VideoModeHandle as PlatformVideoModeHandle,
 };
 use crate::window::{
-    CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType, WindowAttributes,
-    WindowButtons, WindowLevel,
+    ActivationToken, CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType,
+    WindowAttributes, WindowButtons, WindowLevel,
 };
 
 use super::util::{self, SelectedCursor};
@@ -1827,6 +1827,11 @@ impl UnownedWindow {
     }
 
     #[inline]
+    /// The token isn't needed on X11: `_NET_ACTIVE_WINDOW` is asked for as [`Self::focus_window`].
+    pub fn activate_with_token(&self, _token: ActivationToken) {
+        self.focus_window();
+    }
+
     pub fn request_activation_token(&self) -> Result<AsyncRequestSerial, NotSupportedError> {
         let serial = AsyncRequestSerial::get();
         self.activation_sender
