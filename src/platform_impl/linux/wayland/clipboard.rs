@@ -44,6 +44,8 @@ const TEXT_MIME_TYPES: [&str; 5] =
 
 /// How long a paste waits for the source to send all of its data before giving up.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a clipboard send can go without making progress.
+const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The most bytes read from another client's selection.
 const MAX_CLIPBOARD_BYTES: usize = 64 * 1024 * 1024;
@@ -209,7 +211,7 @@ impl ClipboardState {
         // The reader may be slow, or be this very process: write off the event loop.
         let spawned = std::thread::Builder::new().name("winit-clipboard".into()).spawn(move || {
             let _permit = permit;
-            if let Err(error) = write_with_timeout(file, text.as_bytes()) {
+            if let Err(error) = write_with_idle_timeout(file, text.as_bytes(), SEND_IDLE_TIMEOUT) {
                 if error.kind() != ErrorKind::BrokenPipe {
                     warn!("Failed to send the clipboard: {error}");
                 }
@@ -533,12 +535,8 @@ fn wait_for_pipe(file: &File, flags: PollFlags, deadline: Instant) -> io::Result
     }
 }
 
-fn write_with_timeout(file: File, bytes: &[u8]) -> io::Result<()> {
-    write_within(file, bytes, READ_TIMEOUT)
-}
-
-fn write_within(mut file: File, mut bytes: &[u8], limit: Duration) -> io::Result<()> {
-    let deadline = Instant::now() + limit;
+fn write_with_idle_timeout(mut file: File, mut bytes: &[u8], limit: Duration) -> io::Result<()> {
+    let mut deadline = Instant::now() + limit;
     nonblocking(&file)?;
     while !bytes.is_empty() {
         remaining(deadline)?;
@@ -546,7 +544,8 @@ fn write_within(mut file: File, mut bytes: &[u8], limit: Duration) -> io::Result
             Ok(0) => return Err(io::Error::from(ErrorKind::WriteZero)),
             Ok(written) => {
                 bytes =
-                    bytes.get(written..).ok_or_else(|| io::Error::from(ErrorKind::InvalidData))?
+                    bytes.get(written..).ok_or_else(|| io::Error::from(ErrorKind::InvalidData))?;
+                deadline = Instant::now() + limit;
             },
             Err(error) if error.kind() == ErrorKind::Interrupted => {},
             Err(error) if error.kind() == ErrorKind::WouldBlock => {

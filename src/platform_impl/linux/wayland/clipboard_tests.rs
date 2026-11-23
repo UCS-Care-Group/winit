@@ -48,6 +48,32 @@ fn an_expired_deadline_takes_precedence_over_ready_data() {
 fn a_peer_that_keeps_the_pipe_open_without_reading_cannot_block_a_send() {
     let (_read, write) = transfer_pair();
     let bytes = vec![7; 2 << 20];
-    let error = write_within(write, &bytes, Duration::from_millis(50)).unwrap_err();
+    let error = write_with_idle_timeout(write, &bytes, Duration::from_millis(50)).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::TimedOut);
+}
+
+#[test]
+fn a_slow_reader_receives_the_whole_selection_while_the_send_keeps_moving() {
+    let (mut read, write) = transfer_pair();
+    let text = vec![b'x'; 4 << 20];
+    let reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut received = Vec::new();
+        let mut chunk = [0; 64 << 10];
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let count = read.read(&mut chunk)?;
+            if count == 0 {
+                return Ok(received);
+            }
+            received.extend_from_slice(&chunk[..count]);
+        }
+    });
+    let idle_limit = Duration::from_millis(500);
+    let start = Instant::now();
+    let result = write_with_idle_timeout(write, &text, idle_limit);
+    let received = reader.join().unwrap().unwrap();
+
+    assert!(start.elapsed() > idle_limit);
+    result.unwrap();
+    assert_eq!(received, text);
 }

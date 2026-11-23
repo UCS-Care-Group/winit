@@ -55,3 +55,8 @@ changelog entry.
   the compositor's separate PRIMARY selection for selected text and middle-click paste where
   supported. Reading another client is subject to the same two-second deadline and 64 MiB limit
   as the regular clipboard.
+
+### Changed
+
+- On Wayland, sending the clipboard or PRIMARY selection to another client stops after two
+  seconds without write progress. At most four sends can run concurrently.
