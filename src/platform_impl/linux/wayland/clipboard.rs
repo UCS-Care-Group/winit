@@ -7,20 +7,34 @@
 
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use tracing::warn;
+use rustix::event::{poll, PollFd, PollFlags};
+use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+use tracing::{debug, warn};
 
 use sctk::data_device_manager::data_device::DataDeviceData;
 use sctk::data_device_manager::data_source::DataSourceData;
 use sctk::data_device_manager::WritePipe;
+use sctk::primary_selection::{
+    device::{PrimarySelectionDevice, PrimarySelectionDeviceHandler},
+    selection::{PrimarySelectionSource, PrimarySelectionSourceHandler},
+    PrimarySelectionManagerState,
+};
 use sctk::reexports::client::backend::ObjectId;
+use sctk::reexports::client::globals::GlobalList;
 use sctk::reexports::client::protocol::wl_data_device::WlDataDevice;
 use sctk::reexports::client::protocol::wl_data_device_manager::WlDataDeviceManager;
 use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
+use sctk::reexports::client::protocol::wl_seat::WlSeat;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
+use sctk::reexports::protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+    zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+};
 
 use crate::platform_impl::wayland::state::WinitState;
 
@@ -30,9 +44,12 @@ const TEXT_MIME_TYPES: [&str; 5] =
 
 /// How long a paste waits for the source to send all of its data before giving up.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a clipboard send can go without making progress.
+const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The most bytes read from another client's selection.
 const MAX_CLIPBOARD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ACTIVE_SENDS: usize = 4;
 
 /// Every live clipboard, so one can be found from the display handle a toolkit is given.
 static CLIPBOARDS: Mutex<Vec<Weak<ClipboardState>>> = Mutex::new(Vec::new());
@@ -43,11 +60,13 @@ pub struct ClipboardState {
     connection: Connection,
     queue_handle: QueueHandle<WinitState>,
     manager: Option<WlDataDeviceManager>,
+    primary_manager: Option<PrimarySelectionManagerState>,
     /// The `wl_display` pointer, to match a raw display handle.
     display: usize,
     /// A marker type offered with our own selection, so we recognise it when it comes back.
     marker: String,
     inner: Mutex<Inner>,
+    active_sends: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Default)]
@@ -62,7 +81,11 @@ struct Inner {
 #[derive(Debug)]
 struct SeatClipboard {
     seat: ObjectId,
-    device: WlDataDevice,
+    device: Option<WlDataDevice>,
+    primary: Option<PrimarySelectionDevice>,
+    // SCTK's PrimarySelectionSource destroys its proxy when dropped. This also covers replacing
+    // the selection, a compositor cancellation, and removal of the entire seat.
+    owned_primary: Option<(PrimarySelectionSource, Arc<str>)>,
     /// The serial of the latest input event on this seat, which setting the selection needs.
     serial: Option<u32>,
 }
@@ -78,18 +101,21 @@ impl ClipboardState {
         connection: &Connection,
         queue_handle: &QueueHandle<WinitState>,
         manager: Option<WlDataDeviceManager>,
+        globals: &GlobalList,
     ) -> Arc<Self> {
         let display = connection.display().id().as_ptr() as usize;
         let state = Arc::new(Self {
             connection: connection.clone(),
             queue_handle: queue_handle.clone(),
             manager,
+            primary_manager: PrimarySelectionManagerState::bind(globals, queue_handle).ok(),
             display,
             marker: format!(
                 "application/x-winit-selection;pid={};display={display:x}",
                 std::process::id()
             ),
             inner: Mutex::new(Inner::default()),
+            active_sends: Arc::default(),
         });
 
         let mut clipboards = CLIPBOARDS.lock().unwrap();
@@ -107,10 +133,23 @@ impl ClipboardState {
             .find(|clipboard| clipboard.display == display as usize)
     }
 
-    pub fn add_seat(&self, seat: ObjectId, device: WlDataDevice) {
+    pub fn add_seat(&self, seat: &WlSeat, device: Option<WlDataDevice>) {
         let mut inner = self.inner.lock().unwrap();
-        inner.seats.retain(|entry| entry.seat != seat);
-        inner.seats.push(SeatClipboard { seat, device, serial: None });
+        let seat_id = seat.id();
+        if inner.seats.iter().any(|entry| entry.seat == seat_id) {
+            return;
+        }
+        let primary = self
+            .primary_manager
+            .as_ref()
+            .map(|manager| manager.get_selection_device(&self.queue_handle, seat));
+        inner.seats.push(SeatClipboard {
+            seat: seat_id,
+            device,
+            primary,
+            owned_primary: None,
+            serial: None,
+        });
     }
 
     pub fn remove_seat(&self, seat: &ObjectId) {
@@ -148,13 +187,31 @@ impl ClipboardState {
     /// Sends our selection's text through the pipe the compositor gave us.
     pub fn send(&self, source: &WlDataSource, mime_type: &str, pipe: WritePipe) {
         let Some(text) = self.owned_text(source) else { return };
+        self.send_text(text, mime_type, pipe);
+    }
+
+    fn send_text(&self, text: Arc<str>, mime_type: &str, pipe: WritePipe) {
         if !TEXT_MIME_TYPES.contains(&mime_type) && mime_type != self.marker {
             return;
         }
-        let mut file = File::from(OwnedFd::from(pipe));
+        let file = File::from(OwnedFd::from(pipe));
+        if self
+            .active_sends
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < MAX_ACTIVE_SENDS).then(|| count + 1)
+            })
+            .is_err()
+        {
+            debug!(
+                "Refusing a Wayland clipboard send: {MAX_ACTIVE_SENDS} transfers already active"
+            );
+            return;
+        }
+        let permit = SendPermit(self.active_sends.clone());
         // The reader may be slow, or be this very process: write off the event loop.
         let spawned = std::thread::Builder::new().name("winit-clipboard".into()).spawn(move || {
-            if let Err(error) = file.write_all(text.as_bytes()) {
+            let _permit = permit;
+            if let Err(error) = write_with_idle_timeout(file, text.as_bytes(), SEND_IDLE_TIMEOUT) {
                 if error.kind() != ErrorKind::BrokenPipe {
                     warn!("Failed to send the clipboard: {error}");
                 }
@@ -173,10 +230,64 @@ impl ClipboardState {
             .or_else(|| inner.seats.first())
     }
 
+    pub fn load_primary_text(&self) -> io::Result<String> {
+        let inner = self.inner.lock().map_err(|_| io::Error::other("clipboard lock poisoned"))?;
+        let entry =
+            Self::active_device(&inner).ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+        let device =
+            entry.primary.as_ref().ok_or_else(|| io::Error::from(ErrorKind::Unsupported))?;
+        let owned = entry.owned_primary.as_ref().map(|(_, text)| text);
+        let Some(offer) = device.data().selection_offer() else {
+            return owned
+                .map(|text| text.to_string())
+                .ok_or_else(|| io::Error::from(ErrorKind::NotFound));
+        };
+        let (is_ours, mime) = offer.with_mime_types(|types| {
+            (types.iter().any(|mime| mime == &self.marker), preferred_text_type(types))
+        });
+        if let (true, Some(text)) = (is_ours, owned) {
+            return Ok(text.to_string());
+        }
+        let mime = mime.ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+        let pipe = offer.receive(mime.to_string())?;
+        drop(inner);
+        self.read_text(OwnedFd::from(pipe))
+    }
+
+    pub fn store_primary_text(&self, text: String) -> io::Result<()> {
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "the primary selection is too large",
+            ));
+        }
+        let manager =
+            self.primary_manager.as_ref().ok_or_else(|| io::Error::from(ErrorKind::Unsupported))?;
+        let mut inner =
+            self.inner.lock().map_err(|_| io::Error::other("clipboard lock poisoned"))?;
+        let seat = Self::active_device(&inner).map(|entry| entry.seat.clone());
+        let entry = inner
+            .seats
+            .iter_mut()
+            .find(|entry| Some(&entry.seat) == seat.as_ref())
+            .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
+        let device =
+            entry.primary.as_ref().ok_or_else(|| io::Error::from(ErrorKind::Unsupported))?;
+        let serial = entry
+            .serial
+            .ok_or_else(|| io::Error::other("no input to set the primary selection for"))?;
+        let types = TEXT_MIME_TYPES.into_iter().chain(std::iter::once(self.marker.as_str()));
+        let source = manager.create_selection_source(&self.queue_handle, types);
+        source.set_selection(device, serial);
+        entry.owned_primary = Some((source, text.into()));
+        drop(inner);
+        self.connection.flush().map_err(io::Error::other)
+    }
+
     pub fn load_text(&self) -> io::Result<String> {
         let inner = self.inner.lock().unwrap();
         let offer = Self::active_device(&inner)
-            .and_then(|entry| entry.device.data::<DataDeviceData>())
+            .and_then(|entry| entry.device.as_ref()?.data::<DataDeviceData>())
             .and_then(|data| data.selection_offer());
 
         let Some(offer) = offer else {
@@ -195,8 +306,7 @@ impl ClipboardState {
             }
         }
 
-        let Some(mime) = TEXT_MIME_TYPES.iter().find(|mime| types.iter().any(|t| t == *mime))
-        else {
+        let Some(mime) = preferred_text_type(&types) else {
             return Err(io::Error::new(ErrorKind::InvalidData, "the clipboard holds no text"));
         };
 
@@ -205,10 +315,14 @@ impl ClipboardState {
             other => io::Error::new(ErrorKind::Other, other.to_string()),
         })?;
         drop(inner);
+        self.read_text(OwnedFd::from(pipe))
+    }
+
+    fn read_text(&self, pipe: OwnedFd) -> io::Result<String> {
         // The source only writes once the compositor has our request.
         self.connection.flush().map_err(|error| io::Error::new(ErrorKind::Other, error))?;
 
-        let bytes = read_with_timeout(File::from(OwnedFd::from(pipe)), MAX_CLIPBOARD_BYTES)?;
+        let bytes = read_with_timeout(File::from(pipe), MAX_CLIPBOARD_BYTES)?;
         let text = String::from_utf8_lossy(&bytes);
         // `text/*` types use CRLF line endings, but applications expect LF.
         Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
@@ -220,7 +334,7 @@ impl ClipboardState {
     pub fn load_mime(&self, mimes: &[&str], max_bytes: usize) -> io::Result<(String, Vec<u8>)> {
         let inner = self.inner.lock().unwrap();
         let offer = Self::active_device(&inner)
-            .and_then(|entry| entry.device.data::<DataDeviceData>())
+            .and_then(|entry| entry.device.as_ref()?.data::<DataDeviceData>())
             .and_then(|data| data.selection_offer());
         let Some(offer) = offer else {
             return Err(io::Error::new(ErrorKind::NotFound, "the clipboard is empty"));
@@ -254,7 +368,7 @@ impl ClipboardState {
     pub fn offers(&self, mimes: &[&str]) -> bool {
         let inner = self.inner.lock().unwrap();
         let offer = Self::active_device(&inner)
-            .and_then(|entry| entry.device.data::<DataDeviceData>())
+            .and_then(|entry| entry.device.as_ref()?.data::<DataDeviceData>())
             .and_then(|data| data.selection_offer());
         let Some(offer) = offer else { return false };
         let types = offer.with_mime_types(|types| types.to_vec());
@@ -276,12 +390,14 @@ impl ClipboardState {
             return Err(io::Error::new(ErrorKind::Other, "no input to set the clipboard for"));
         };
 
+        let device =
+            entry.device.as_ref().ok_or_else(|| io::Error::from(ErrorKind::Unsupported))?;
         let source = manager.create_data_source(&self.queue_handle, DataSourceData::default());
         for mime in TEXT_MIME_TYPES {
             source.offer(mime.to_owned());
         }
         source.offer(self.marker.clone());
-        entry.device.set_selection(Some(&source), serial);
+        device.set_selection(Some(&source), serial);
 
         if let Some(previous) = inner.owned.replace(OwnedSelection { source, text: text.into() }) {
             previous.source.destroy();
@@ -289,6 +405,61 @@ impl ClipboardState {
         drop(inner);
         self.connection.flush().map_err(|error| io::Error::new(ErrorKind::Other, error))
     }
+}
+
+impl PrimarySelectionDeviceHandler for WinitState {
+    fn selection(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &ZwpPrimarySelectionDeviceV1,
+    ) {
+        // SCTK already recorded the offer on its device.
+    }
+}
+
+impl PrimarySelectionSourceHandler for WinitState {
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &ZwpPrimarySelectionSourceV1,
+        mime: String,
+        pipe: WritePipe,
+    ) {
+        let text = self.clipboard.inner.lock().ok().and_then(|inner| {
+            inner
+                .seats
+                .iter()
+                .filter_map(|seat| seat.owned_primary.as_ref())
+                .find(|(owned, _)| owned.inner() == source)
+                .map(|(_, text)| text.clone())
+        });
+        if let Some(text) = text {
+            self.clipboard.send_text(text, &mime, pipe);
+        }
+    }
+
+    fn cancelled(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &ZwpPrimarySelectionSourceV1,
+    ) {
+        if let Ok(mut inner) = self.clipboard.inner.lock() {
+            if let Some(entry) = inner.seats.iter_mut().find(|seat| {
+                seat.owned_primary.as_ref().is_some_and(|(owned, _)| owned.inner() == source)
+            }) {
+                entry.owned_primary = None;
+            }
+        }
+    }
+}
+
+sctk::delegate_primary_selection!(WinitState);
+
+fn preferred_text_type(types: &[String]) -> Option<&'static str> {
+    TEXT_MIME_TYPES.into_iter().find(|mime| types.iter().any(|offered| offered == mime))
 }
 
 impl Drop for ClipboardState {
@@ -306,18 +477,12 @@ fn read_with_timeout(file: File, max_bytes: usize) -> io::Result<Vec<u8>> {
 
 fn read_within(mut file: File, max_bytes: usize, limit: Duration) -> io::Result<Vec<u8>> {
     let deadline = Instant::now() + limit;
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is a valid descriptor owned by `file`.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+    nonblocking(&file)?;
 
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
+        remaining(deadline)?;
         match file.read(&mut chunk) {
             Ok(0) => return Ok(bytes),
             Ok(read) => {
@@ -327,90 +492,71 @@ fn read_within(mut file: File, max_bytes: usize, limit: Duration) -> io::Result<
                         "the clipboard is too large",
                     ));
                 }
-                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(read_bytes) = chunk.get(..read) {
+                    bytes.extend_from_slice(read_bytes);
+                }
             },
             Err(error) if error.kind() == ErrorKind::Interrupted => {},
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(io::Error::new(
-                        ErrorKind::TimedOut,
-                        "the clipboard's owner did not send it in time",
-                    ));
-                }
-                let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-                let millis = left.as_millis().min(i32::MAX as u128).max(1) as i32;
-                // SAFETY: `poll` points to one valid `pollfd`.
-                let ready = unsafe { libc::poll(&mut poll, 1, millis) };
-                if ready == 0 {
-                    return Err(io::Error::new(
-                        ErrorKind::TimedOut,
-                        "the clipboard's owner did not send it",
-                    ));
-                }
-                if ready < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
+                wait_for_pipe(&file, PollFlags::IN, deadline)?;
             },
             Err(error) => return Err(error),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
+struct SendPermit(Arc<AtomicUsize>);
 
-    fn pipe_with(bytes: &[u8]) -> File {
-        let mut fds = [0; 2];
-        // SAFETY: `fds` has room for the two descriptors `pipe` writes.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        // SAFETY: both descriptors are fresh and owned here.
-        let (mut write, read) = unsafe {
-            (
-                <File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]),
-                <File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]),
-            )
-        };
-        write.write_all(bytes).unwrap();
-        read
-    }
-
-    #[test]
-    fn a_slow_trickle_still_ends_at_the_deadline() {
-        let mut fds = [0; 2];
-        // SAFETY: `fds` has room for the two descriptors `pipe` writes.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        // SAFETY: both descriptors are fresh and owned here.
-        let (mut write, read) = unsafe {
-            (
-                <File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]),
-                <File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]),
-            )
-        };
-        let writer = std::thread::spawn(move || {
-            for _ in 0..40 {
-                if write.write_all(b"x").is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        });
-        let start = Instant::now();
-        let error = read_within(read, 1 << 20, Duration::from_millis(300)).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::TimedOut);
-        assert!(start.elapsed() < Duration::from_millis(900));
-        let _ = writer.join();
-    }
-
-    #[test]
-    fn reads_up_to_the_cap_and_refuses_more() {
-        assert_eq!(read_with_timeout(pipe_with(&[7; 100]), 100).unwrap().len(), 100);
-        let error = read_with_timeout(pipe_with(&[7; 101]), 100).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
+impl Drop for SendPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+fn nonblocking(file: &File) -> io::Result<()> {
+    let flags = fcntl_getfl(file)?;
+    Ok(fcntl_setfl(file, flags | OFlags::NONBLOCK)?)
+}
+
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(ErrorKind::TimedOut, "clipboard transfer deadline expired"));
+    }
+    Ok(left)
+}
+
+fn wait_for_pipe(file: &File, flags: PollFlags, deadline: Instant) -> io::Result<()> {
+    use rustix::io::Errno;
+    let millis = remaining(deadline)?.as_millis().clamp(1, i32::MAX as u128) as i32;
+    match poll(&mut [PollFd::new(file, flags)], millis) {
+        Ok(_) | Err(Errno::INTR) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_with_idle_timeout(mut file: File, mut bytes: &[u8], limit: Duration) -> io::Result<()> {
+    let mut deadline = Instant::now() + limit;
+    nonblocking(&file)?;
+    while !bytes.is_empty() {
+        remaining(deadline)?;
+        match file.write(bytes) {
+            Ok(0) => return Err(io::Error::from(ErrorKind::WriteZero)),
+            Ok(written) => {
+                bytes =
+                    bytes.get(written..).ok_or_else(|| io::Error::from(ErrorKind::InvalidData))?;
+                deadline = Instant::now() + limit;
+            },
+            Err(error) if error.kind() == ErrorKind::Interrupted => {},
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                wait_for_pipe(&file, PollFlags::OUT, deadline)?
+            },
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "clipboard_tests.rs"]
+mod tests;

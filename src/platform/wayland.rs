@@ -80,6 +80,17 @@ impl Clipboard {
         self.state()?.load_text()
     }
 
+    /// Reads the active seat's PRIMARY selection, independently of the regular clipboard.
+    /// External transfers use the same time and size limits as [`Clipboard::load_text`].
+    pub fn load_primary_text(&self) -> io::Result<String> {
+        self.state()?.load_primary_text()
+    }
+
+    /// Offers text as the active seat's PRIMARY selection in response to input, if supported.
+    pub fn store_primary_text(&self, text: impl Into<String>) -> io::Result<()> {
+        self.state()?.store_primary_text(text.into())
+    }
+
     /// The first of `mimes`, in order of preference, that the clipboard of the seat the
     /// application last received input from offers, as `(type, bytes)`: for HTML and pictures,
     /// which [`Clipboard::load_text`] doesn't carry. Reads at most `max_bytes` (and never more
