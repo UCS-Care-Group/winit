@@ -168,6 +168,7 @@ impl WinitState {
             connection,
             queue_handle,
             data_device_manager_state.as_ref().map(|manager| manager.data_device_manager().clone()),
+            globals,
         );
 
         let mut seats = AHashMap::default();
@@ -175,9 +176,7 @@ impl WinitState {
             let data_device = data_device_manager_state
                 .as_ref()
                 .map(|manager| manager.get_data_device(queue_handle, &seat));
-            if let Some(data_device) = &data_device {
-                clipboard.add_seat(seat.id(), data_device.inner().clone());
-            }
+            clipboard.add_seat(&seat, data_device.as_ref().map(|device| device.inner().clone()));
             seats.insert(seat.id(), WinitSeatState::new(data_device));
         }
 
