@@ -51,3 +51,7 @@ changelog entry.
   picture) the clipboard offers, with a size cap.
 - On Wayland, add `Clipboard::offers`, which says whether the clipboard offers a MIME type
   without reading it, and read the clipboard against one overall deadline.
+- On Wayland, add `Clipboard::load_primary_text` and `Clipboard::store_primary_text`. These use
+  the compositor's separate PRIMARY selection for selected text and middle-click paste where
+  supported. Reading another client is subject to the same two-second deadline and 64 MiB limit
+  as the regular clipboard.

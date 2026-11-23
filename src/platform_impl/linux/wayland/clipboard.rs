@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use sctk::data_device_manager::data_device::DataDeviceData;
 use sctk::data_device_manager::data_source::DataSourceData;
@@ -81,6 +81,8 @@ struct SeatClipboard {
     seat: ObjectId,
     device: Option<WlDataDevice>,
     primary: Option<PrimarySelectionDevice>,
+    // SCTK's PrimarySelectionSource destroys its proxy when dropped. This also covers replacing
+    // the selection, a compositor cancellation, and removal of the entire seat.
     owned_primary: Option<(PrimarySelectionSource, Arc<str>)>,
     /// The serial of the latest input event on this seat, which setting the selection needs.
     serial: Option<u32>,
@@ -198,6 +200,9 @@ impl ClipboardState {
             })
             .is_err()
         {
+            debug!(
+                "Refusing a Wayland clipboard send: {MAX_ACTIVE_SENDS} transfers already active"
+            );
             return;
         }
         let permit = SendPermit(self.active_sends.clone());
